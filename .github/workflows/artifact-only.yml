@@ -1,6 +1,8 @@
-# Manual unsigned Windows and macOS artifacts for this fork.
-# workflow_dispatch only: it does not publish a release, notarize, or use upstream signing identities.
-# Packaged product name, updater URL, and electron-builder.yml stay unchanged.
+# Unsigned Windows and macOS packages for this fork.
+# workflow_dispatch is kept for a single target, but GitHub only dispatches workflows
+# that exist on the default branch. This file is intentionally not on main.
+# A push to the logo branch runs the standard hosted builds below.
+# Runners are windows-2022 and macos-latest only. No larger runners, signing secrets, or publish.
 
 name: Artifact-only desktop build
 
@@ -16,18 +18,23 @@ on:
           - windows-arm64
           - mac-arm64
           - mac-x64
+  push:
+    branches:
+      - cursor/liangxin-app-icon-v223-806c
 
 permissions:
   contents: read
 
 concurrency:
-  group: artifact-only-${{ github.ref }}-${{ inputs.target }}
-  cancel-in-progress: false
+  group: artifact-only-${{ github.ref }}-${{ github.event_name }}-${{ inputs.target }}
+  cancel-in-progress: true
 
 jobs:
   guard:
     name: Refuse upstream
     runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
     steps:
       - name: Refuse the upstream repository
         shell: bash
@@ -37,26 +44,58 @@ jobs:
             exit 1
           fi
 
+      - name: Select targets
+        id: targets
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_TARGET: ${{ inputs.target }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "$REQUESTED_TARGET" in
+              windows-x64|windows-arm64|mac-arm64|mac-x64) ;;
+              *)
+                echo "Unknown target: $REQUESTED_TARGET" >&2
+                exit 1
+                ;;
+            esac
+            echo "targets=[\"$REQUESTED_TARGET\"]" >> "$GITHUB_OUTPUT"
+          else
+            echo 'targets=["windows-x64","mac-arm64","mac-x64","windows-arm64"]' >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    name: Unsigned ${{ inputs.target }}
+    name: Unsigned ${{ matrix.target }}
     needs: guard
-    runs-on: ${{ startsWith(inputs.target, 'windows-') && 'windows-2022' || 'macos-latest' }}
+    runs-on: ${{ startsWith(matrix.target, 'windows-') && 'windows-2022' || 'macos-latest' }}
     timeout-minutes: 180
+    continue-on-error: ${{ matrix.target == 'windows-arm64' }}
     permissions:
       contents: read
       actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.guard.outputs.targets) }}
     env:
-      TARGET: ${{ inputs.target }}
+      TARGET: ${{ matrix.target }}
+      RUNNER_LABEL: ${{ startsWith(matrix.target, 'windows-') && 'windows-2022' || 'macos-latest' }}
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
       NODE_OPTIONS: --max-old-space-size=8192
     steps:
-      - name: Refuse signing credentials
+      - name: Refuse non-standard runners and signing credentials
         shell: bash
         run: |
+          if [ "$RUNNER_LABEL" != "windows-2022" ] && [ "$RUNNER_LABEL" != "macos-latest" ]; then
+            echo "Refusing runner label $RUNNER_LABEL. Only standard windows-2022 and macos-latest are allowed." >&2
+            exit 1
+          fi
           if [ -n "${WIN_SIGN:-}" ] || [ -n "${CSC_LINK:-}" ] || [ -n "${CSC_NAME:-}" ] || [ -n "${APPLE_ID:-}" ] || [ -n "${CHERRY_CERT_PATH:-}" ]; then
             echo "Refusing to build while signing credentials are present." >&2
             exit 1
           fi
+          echo "Requested standard runner: $RUNNER_LABEL"
+          echo "Runner OS: ${RUNNER_OS:-unknown} ${RUNNER_ARCH:-unknown}"
 
       - name: Check out Git repository
         uses: actions/checkout@v7
@@ -67,7 +106,7 @@ jobs:
           node-version-file: .node-version
 
       - name: macOS native build prerequisites
-        if: startsWith(inputs.target, 'mac-')
+        if: startsWith(matrix.target, 'mac-')
         run: brew install python-setuptools
 
       - name: Install pnpm
@@ -111,11 +150,33 @@ jobs:
             find dist -maxdepth 2 -type f -print >&2 || true
             exit 1
           fi
+          : > artifacts/SHA256SUMS
+          {
+            echo "### ${TARGET}"
+            echo
+            echo "Runner label: ${RUNNER_LABEL}"
+            echo
+            echo "| File | Bytes | SHA-256 |"
+            echo "| --- | ---: | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for file in artifacts/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            [ "$name" = "SHA256SUMS" ] && continue
+            bytes=$(wc -c < "$file" | tr -d ' ')
+            if command -v sha256sum >/dev/null 2>&1; then
+              hash=$(sha256sum "$file" | awk '{print $1}')
+            else
+              hash=$(shasum -a 256 "$file" | awk '{print $1}')
+            fi
+            printf '%s  %s\n' "$hash" "$name" >> artifacts/SHA256SUMS
+            echo "| \`$name\` | $bytes | \`$hash\` |" >> "$GITHUB_STEP_SUMMARY"
+          done
 
       - name: Upload unsigned artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: cherry-studio-unsigned-${{ inputs.target }}
+          name: cherry-studio-unsigned-${{ matrix.target }}
           path: artifacts/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
