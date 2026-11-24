@@ -1,0 +1,121 @@
+# Manual unsigned Windows and macOS artifacts for this fork.
+# workflow_dispatch only: it does not publish a release, notarize, or use upstream signing identities.
+# Packaged product name, updater URL, and electron-builder.yml stay unchanged.
+
+name: Artifact-only desktop build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Unsigned installer to build
+        required: true
+        type: choice
+        options:
+          - windows-x64
+          - windows-arm64
+          - mac-arm64
+          - mac-x64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifact-only-${{ github.ref }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Refuse upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse the upstream repository
+        shell: bash
+        run: |
+          if [ "$GITHUB_REPOSITORY" = "CherryHQ/cherry-studio" ]; then
+            echo "This workflow is only for the aiiqc fork. It must not run on CherryHQ/cherry-studio." >&2
+            exit 1
+          fi
+
+  build:
+    name: Unsigned ${{ inputs.target }}
+    needs: guard
+    runs-on: ${{ startsWith(inputs.target, 'windows-') && 'windows-2022' || 'macos-latest' }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: write
+    env:
+      TARGET: ${{ inputs.target }}
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      NODE_OPTIONS: --max-old-space-size=8192
+    steps:
+      - name: Refuse signing credentials
+        shell: bash
+        run: |
+          if [ -n "${WIN_SIGN:-}" ] || [ -n "${CSC_LINK:-}" ] || [ -n "${CSC_NAME:-}" ] || [ -n "${APPLE_ID:-}" ] || [ -n "${CHERRY_CERT_PATH:-}" ]; then
+            echo "Refusing to build while signing credentials are present." >&2
+            exit 1
+          fi
+
+      - name: Check out Git repository
+        uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+
+      - name: macOS native build prerequisites
+        if: startsWith(inputs.target, 'mac-')
+        run: brew install python-setuptools
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the Electron bundle
+        shell: bash
+        run: pnpm run build
+
+      - name: Package an unsigned installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            windows-x64) args=(--win --x64) ;;
+            windows-arm64) args=(--win --arm64) ;;
+            mac-arm64) args=(--mac --arm64) ;;
+            mac-x64) args=(--mac --x64) ;;
+            *)
+              echo "Unknown target: $TARGET" >&2
+              exit 1
+              ;;
+          esac
+          pnpm exec electron-builder "${args[@]}" --publish never
+
+      - name: Collect installer files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ "$TARGET" == windows-* ]]; then
+            find dist -maxdepth 1 -type f \( -name '*-setup.exe' -o -name '*-portable.exe' \) -exec cp {} artifacts/ \;
+          else
+            find dist -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' \) -exec cp {} artifacts/ \;
+          fi
+          if ! find artifacts -type f -print -quit | grep -q .; then
+            echo "No installer artifacts were produced." >&2
+            find dist -maxdepth 2 -type f -print >&2 || true
+            exit 1
+          fi
+
+      - name: Upload unsigned artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: cherry-studio-unsigned-${{ inputs.target }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
