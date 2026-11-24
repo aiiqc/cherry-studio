@@ -1,0 +1,248 @@
+# Unsigned Windows and macOS packages for this fork.
+# workflow_dispatch is kept for a single target, but GitHub only dispatches workflows
+# that exist on the default branch. This file is intentionally not on main.
+# A push to the logo branch runs the standard hosted builds below.
+# Runners are windows-2022 and macos-latest only. No larger runners, signing secrets, or publish.
+
+name: Artifact-only desktop build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Unsigned installer to build
+        required: true
+        type: choice
+        options:
+          - windows-x64
+          - windows-arm64
+          - mac-arm64
+          - mac-x64
+  push:
+    branches:
+      - cursor/liangxin-app-icon-v223-806c
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifact-only-${{ github.ref }}-${{ github.event_name }}-${{ inputs.target }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Refuse upstream
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - name: Refuse the upstream repository
+        shell: bash
+        run: |
+          if [ "$GITHUB_REPOSITORY" = "CherryHQ/cherry-studio" ]; then
+            echo "This workflow is only for the aiiqc fork. It must not run on CherryHQ/cherry-studio." >&2
+            exit 1
+          fi
+
+      - name: Select targets
+        id: targets
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_TARGET: ${{ inputs.target }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "$REQUESTED_TARGET" in
+              windows-x64|windows-arm64|mac-arm64|mac-x64) ;;
+              *)
+                echo "Unknown target: $REQUESTED_TARGET" >&2
+                exit 1
+                ;;
+            esac
+            echo "targets=[\"$REQUESTED_TARGET\"]" >> "$GITHUB_OUTPUT"
+          else
+            # Mac-only until the bundle seal is fixed. Windows packages remain run 45353175978.
+            echo 'targets=["mac-arm64","mac-x64"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Unsigned ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ startsWith(matrix.target, 'windows-') && 'windows-2022' || 'macos-latest' }}
+    timeout-minutes: 180
+    continue-on-error: ${{ matrix.target == 'windows-arm64' }}
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.guard.outputs.targets) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      RUNNER_LABEL: ${{ startsWith(matrix.target, 'windows-') && 'windows-2022' || 'macos-latest' }}
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      NODE_OPTIONS: --max-old-space-size=8192
+    steps:
+      - name: Refuse non-standard runners and signing credentials
+        shell: bash
+        run: |
+          if [ "$RUNNER_LABEL" != "windows-2022" ] && [ "$RUNNER_LABEL" != "macos-latest" ]; then
+            echo "Refusing runner label $RUNNER_LABEL. Only standard windows-2022 and macos-latest are allowed." >&2
+            exit 1
+          fi
+          if [ -n "${WIN_SIGN:-}" ] || [ -n "${CSC_LINK:-}" ] || [ -n "${CSC_NAME:-}" ] || [ -n "${APPLE_ID:-}" ] || [ -n "${CHERRY_CERT_PATH:-}" ]; then
+            echo "Refusing to build while signing credentials are present." >&2
+            exit 1
+          fi
+          echo "Requested standard runner: $RUNNER_LABEL"
+          echo "Runner OS: ${RUNNER_OS:-unknown} ${RUNNER_ARCH:-unknown}"
+
+      - name: Check out Git repository
+        uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+
+      - name: macOS native build prerequisites
+        if: startsWith(matrix.target, 'mac-')
+        run: brew install python-setuptools
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the Electron bundle
+        shell: bash
+        run: pnpm run build
+
+      - name: Package an unsigned installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            windows-x64) args=(--win --x64) ;;
+            windows-arm64) args=(--win --arm64) ;;
+            # identity "-" is an ad-hoc seal. It is not a Developer ID and is not notarized.
+            mac-arm64) args=(--mac --arm64 -c.mac.identity=-) ;;
+            mac-x64) args=(--mac --x64 -c.mac.identity=-) ;;
+            *)
+              echo "Unknown target: $TARGET" >&2
+              exit 1
+              ;;
+          esac
+          pnpm exec electron-builder "${args[@]}" --publish never
+
+      - name: Verify the Mac bundle seal and launch once
+        if: startsWith(matrix.target, 'mac-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "mac-arm64" ]; then
+            APP="dist/mac-arm64/Cherry Studio.app"
+          else
+            APP="dist/mac/Cherry Studio.app"
+          fi
+          if [ ! -d "$APP" ]; then
+            find dist -type d -name 'Cherry Studio.app' -print >&2
+            echo "Packaged app not found at $APP" >&2
+            exit 1
+          fi
+          mkdir -p artifacts
+          {
+            echo "target=$TARGET"
+            echo "runner_label=$RUNNER_LABEL"
+            echo "quarantine=$(xattr -p com.apple.quarantine "$APP" 2>/dev/null || echo absent)"
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            codesign --verify --strict "$APP/Contents/Frameworks/Electron Framework.framework"
+            codesign --verify --strict "$APP/Contents/Frameworks/Cherry Studio Helper.app"
+            codesign -dv --verbose=4 "$APP"
+          } > artifacts/CODESIGN.txt 2>&1
+          if grep -q "linker-signed" artifacts/CODESIGN.txt || grep -q "Info.plist=not bound" artifacts/CODESIGN.txt || grep -q "Sealed Resources=none" artifacts/CODESIGN.txt; then
+            echo "Main executable is still only a linker signature, not a sealed bundle" >&2
+            cat artifacts/CODESIGN.txt >&2
+            exit 1
+          fi
+          if ! grep -q "Identifier=com.kangfenmao.CherryStudio" artifacts/CODESIGN.txt || ! grep -q "Sealed Resources version=" artifacts/CODESIGN.txt || ! grep -q "Info.plist entries=" artifacts/CODESIGN.txt; then
+            echo "Bundle identifier, Info.plist, or sealed resources were not recorded" >&2
+            cat artifacts/CODESIGN.txt >&2
+            exit 1
+          fi
+          set +e
+          spctl --assess --verbose=4 --type execute "$APP" > artifacts/SPCTL.txt 2>&1
+          spctl_exit=$?
+          set -e
+          echo "spctl_exit=$spctl_exit" >> artifacts/SPCTL.txt
+          if [ "$spctl_exit" -eq 0 ]; then
+            echo "Unexpected Gatekeeper pass. This workflow must not present an ad-hoc build as notarized." >&2
+            exit 1
+          fi
+          LOG="$RUNNER_TEMP/cherry-launch.log"
+          "$APP/Contents/MacOS/Cherry Studio" > "$LOG" 2>&1 &
+          pid=$!
+          sleep 8
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "launch_smoke=alive pid=$pid" | tee artifacts/LAUNCH.txt
+            kill "$pid" || true
+          else
+            set +e
+            wait "$pid"
+            launch_exit=$?
+            set -e
+            {
+              echo "launch_smoke=exited exit=$launch_exit"
+              cat "$LOG"
+            } | tee artifacts/LAUNCH.txt >&2
+            exit 1
+          fi
+
+      - name: Collect installer files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ "$TARGET" == windows-* ]]; then
+            find dist -maxdepth 1 -type f \( -name '*-setup.exe' -o -name '*-portable.exe' \) -exec cp {} artifacts/ \;
+          else
+            find dist -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.zip' \) -exec cp {} artifacts/ \;
+          fi
+          if ! find artifacts -type f -print -quit | grep -q .; then
+            echo "No installer artifacts were produced." >&2
+            find dist -maxdepth 2 -type f -print >&2 || true
+            exit 1
+          fi
+          : > artifacts/SHA256SUMS
+          {
+            echo "### ${TARGET}"
+            echo
+            echo "Runner label: ${RUNNER_LABEL}"
+            echo
+            echo "| File | Bytes | SHA-256 |"
+            echo "| --- | ---: | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for file in artifacts/*; do
+            [ -f "$file" ] || continue
+            name=$(basename "$file")
+            [ "$name" = "SHA256SUMS" ] && continue
+            bytes=$(wc -c < "$file" | tr -d ' ')
+            if command -v sha256sum >/dev/null 2>&1; then
+              hash=$(sha256sum "$file" | awk '{print $1}')
+            else
+              hash=$(shasum -a 256 "$file" | awk '{print $1}')
+            fi
+            printf '%s  %s\n' "$hash" "$name" >> artifacts/SHA256SUMS
+            echo "| \`$name\` | $bytes | \`$hash\` |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Upload unsigned artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cherry-studio-${{ github.sha }}-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: ignore
+          retention-days: 1
