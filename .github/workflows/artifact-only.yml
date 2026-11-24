@@ -61,7 +61,8 @@ jobs:
             esac
             echo "targets=[\"$REQUESTED_TARGET\"]" >> "$GITHUB_OUTPUT"
           else
-            echo 'targets=["windows-x64","mac-arm64","mac-x64","windows-arm64"]' >> "$GITHUB_OUTPUT"
+            # Mac-only until the bundle seal is fixed. Windows packages remain run 45353175978.
+            echo 'targets=["mac-arm64","mac-x64"]' >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -126,14 +127,78 @@ jobs:
           case "$TARGET" in
             windows-x64) args=(--win --x64) ;;
             windows-arm64) args=(--win --arm64) ;;
-            mac-arm64) args=(--mac --arm64) ;;
-            mac-x64) args=(--mac --x64) ;;
+            # identity "-" is an ad-hoc seal. It is not a Developer ID and is not notarized.
+            mac-arm64) args=(--mac --arm64 -c.mac.identity=-) ;;
+            mac-x64) args=(--mac --x64 -c.mac.identity=-) ;;
             *)
               echo "Unknown target: $TARGET" >&2
               exit 1
               ;;
           esac
           pnpm exec electron-builder "${args[@]}" --publish never
+
+      - name: Verify the Mac bundle seal and launch once
+        if: startsWith(matrix.target, 'mac-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "mac-arm64" ]; then
+            APP="dist/mac-arm64/Cherry Studio.app"
+          else
+            APP="dist/mac/Cherry Studio.app"
+          fi
+          if [ ! -d "$APP" ]; then
+            find dist -type d -name 'Cherry Studio.app' -print >&2
+            echo "Packaged app not found at $APP" >&2
+            exit 1
+          fi
+          mkdir -p artifacts
+          {
+            echo "target=$TARGET"
+            echo "runner_label=$RUNNER_LABEL"
+            echo "quarantine=$(xattr -p com.apple.quarantine "$APP" 2>/dev/null || echo absent)"
+            codesign --verify --deep --strict --verbose=2 "$APP"
+            codesign --verify --strict "$APP/Contents/Frameworks/Electron Framework.framework"
+            codesign --verify --strict "$APP/Contents/Frameworks/Cherry Studio Helper.app"
+            codesign -dv --verbose=4 "$APP"
+          } > artifacts/CODESIGN.txt 2>&1
+          if grep -q "linker-signed" artifacts/CODESIGN.txt || grep -q "Info.plist=not bound" artifacts/CODESIGN.txt || grep -q "Sealed Resources=none" artifacts/CODESIGN.txt; then
+            echo "Main executable is still only a linker signature, not a sealed bundle" >&2
+            cat artifacts/CODESIGN.txt >&2
+            exit 1
+          fi
+          if ! grep -q "Identifier=com.kangfenmao.CherryStudio" artifacts/CODESIGN.txt || ! grep -q "Sealed Resources version=" artifacts/CODESIGN.txt || ! grep -q "Info.plist entries=" artifacts/CODESIGN.txt; then
+            echo "Bundle identifier, Info.plist, or sealed resources were not recorded" >&2
+            cat artifacts/CODESIGN.txt >&2
+            exit 1
+          fi
+          set +e
+          spctl --assess --verbose=4 --type execute "$APP" > artifacts/SPCTL.txt 2>&1
+          spctl_exit=$?
+          set -e
+          echo "spctl_exit=$spctl_exit" >> artifacts/SPCTL.txt
+          if [ "$spctl_exit" -eq 0 ]; then
+            echo "Unexpected Gatekeeper pass. This workflow must not present an ad-hoc build as notarized." >&2
+            exit 1
+          fi
+          LOG="$RUNNER_TEMP/cherry-launch.log"
+          "$APP/Contents/MacOS/Cherry Studio" > "$LOG" 2>&1 &
+          pid=$!
+          sleep 8
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "launch_smoke=alive pid=$pid" | tee artifacts/LAUNCH.txt
+            kill "$pid" || true
+          else
+            set +e
+            wait "$pid"
+            launch_exit=$?
+            set -e
+            {
+              echo "launch_smoke=exited exit=$launch_exit"
+              cat "$LOG"
+            } | tee artifacts/LAUNCH.txt >&2
+            exit 1
+          fi
 
       - name: Collect installer files
         shell: bash
@@ -174,9 +239,10 @@ jobs:
           done
 
       - name: Upload unsigned artifacts
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: cherry-studio-unsigned-${{ matrix.target }}
+          name: cherry-studio-${{ github.sha }}-${{ matrix.target }}
           path: artifacts/*
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 1
